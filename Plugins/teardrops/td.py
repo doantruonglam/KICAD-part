@@ -6,14 +6,12 @@
 # Based on Teardrops for PCBNEW by svofski, 2014 http://sensi.org/~svo
 # Cubic Bezier upgrade by mitxela, 2021 mitxela.com
 
-import os
-import sys
-from math import cos, acos, sin, asin, tan, atan2, sqrt, pi
-from pcbnew import VIA, ToMM, TRACK, FromMM, wxPoint, GetBoard, ZONE_CONTAINER
-from pcbnew import PAD_ATTRIB_STANDARD, PAD_ATTRIB_SMD, ZONE_FILLER, VECTOR2I
-from pcbnew import STARTPOINT, ENDPOINT
+from math import cos, sin, asin, atan2, sqrt, pi
+from pcbnew import PCB_VIA, ToMM, PCB_TRACK, PCB_ARC, FromMM, wxPoint, GetBoard, ZONE
+from pcbnew import PAD_ATTRIB_PTH, PAD_ATTRIB_SMD, ZONE_FILLER, VECTOR2I
+from pcbnew import STARTPOINT, ENDPOINT, ZONE_SETTINGS, ZONE_CONNECTION_FULL, ZONE_FILL_MODE_POLYGONS
 
-__version__ = "0.4.11"
+__version__ = "0.6.0"
 
 ToUnits = ToMM
 FromUnits = FromMM
@@ -26,10 +24,10 @@ def __GetAllVias(board):
     vias = []
     vias_selected = []
     for item in board.GetTracks():
-        if type(item) == VIA:
+        if item.GetClass() == "PCB_VIA":
             pos = item.GetPosition()
             width = item.GetWidth()
-            drill = item.GetDrillValue()
+            drill = PCB_VIA(item).GetDrillValue()
             layer = -1
             vias.append((pos, width, drill, layer))
             if item.IsSelected():
@@ -41,12 +39,11 @@ def __GetAllPads(board, filters=[]):
     """Just retreive all pads from the given board"""
     pads = []
     pads_selected = []
-    for i in range(board.GetPadCount()):
-        pad = board.GetPad(i)
+    for pad in board.GetPads():
         if pad.GetAttribute() in filters:
             pos = pad.GetPosition()
             drill = min(pad.GetSize())
-            """See where the pad is"""
+            # See where the pad is
             if pad.GetAttribute() == PAD_ATTRIB_SMD:
                 # Cannot use GetLayer here because it returns the non-flipped
                 # layer. Need to get the real layer from the layer set
@@ -78,7 +75,7 @@ def __GetAllTeardrops(board):
 def __DoesTeardropBelongTo(teardrop, track, via):
     """Return True if the teardrop covers given track AND via"""
     # First test if the via belongs to the teardrop
-    if not teardrop.HitTestInsideZone(via[0]):
+    if not teardrop.HitTest(via[0]):
         return False
     # In a second time, test if the track belongs to the teardrop
     if not track.HitTest(teardrop.GetBoundingBox().GetCenter()):
@@ -88,14 +85,16 @@ def __DoesTeardropBelongTo(teardrop, track, via):
 
 def __Zone(board, points, track):
     """Add a zone to the board"""
-    z = ZONE_CONTAINER(board)
+    z = ZONE(board)
 
     # Add zone properties
     z.SetLayer(track.GetLayer())
     z.SetNetCode(track.GetNetCode())
-    z.SetZoneClearance(track.GetClearance())
+    z.SetLocalClearance(track.GetLocalClearance(track.GetClass()))
     z.SetMinThickness(25400)  # The minimum
-    z.SetPadConnection(2)  # 2 -> solid
+    z.SetPadConnection(ZONE_CONNECTION_FULL)
+    z.SetCornerSmoothingType(ZONE_SETTINGS.SMOOTHING_NONE)
+    z.SetFillMode(ZONE_FILL_MODE_POLYGONS)
     z.SetIsFilled(True)
     z.SetPriority(MAGIC_TEARDROP_ZONE_ID)
     ol = z.Outline()
@@ -123,9 +122,10 @@ def __Bezier(p1, p2, p3, p4, n=20.0):
     return pts
 
 
-def __PointDistance(a,b):
+def __PointDistance(a, b):
     """Distance between two points"""
     return sqrt((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]))
+
 
 def __ComputeCurved(vpercent, w, vec, via, pts, segs):
     """Compute the curves part points"""
@@ -136,17 +136,17 @@ def __ComputeCurved(vpercent, w, vec, via, pts, segs):
 
     radius = via[1]/2
     minVpercent = float(w*2) / float(via[1])
-    weaken = (vpercent/100.0  -minVpercent) / (1-minVpercent) / radius
+    weaken = (vpercent/100.0 - minVpercent) / (1-minVpercent) / radius
 
-    biasBC = 0.5 * __PointDistance( pts[1], pts[2] )
-    biasAE = 0.5 * __PointDistance( pts[4], pts[0] )
+    biasBC = 0.5 * __PointDistance(pts[1], pts[2])
+    biasAE = 0.5 * __PointDistance(pts[4], pts[0])
 
     vecC = pts[2] - via[0]
-    tangentC = [ pts[2][0] - vecC[1]*biasBC*weaken,
-                 pts[2][1] + vecC[0]*biasBC*weaken ]
+    tangentC = [pts[2][0] - vecC[1]*biasBC*weaken,
+                pts[2][1] + vecC[0]*biasBC*weaken]
     vecE = pts[4] - via[0]
-    tangentE = [ pts[4][0] + vecE[1]*biasAE*weaken,
-                 pts[4][1] - vecE[0]*biasAE*weaken ]
+    tangentE = [pts[4][0] + vecE[1]*biasAE*weaken,
+                pts[4][1] - vecE[0]*biasAE*weaken]
 
     tangentB = [pts[1][0] - vec[0]*biasBC, pts[1][1] - vec[1]*biasBC]
     tangentA = [pts[0][0] - vec[0]*biasAE, pts[0][1] - vec[1]*biasAE]
@@ -171,7 +171,7 @@ def __FindTouchingTrack(t1, endpoint, trackLookup):
         if match:
             # if faced with a Y junction, stop here
             matches += 1
-            if matches>1:
+            if matches > 1:
                 return False, False
             ret = match, t2
     return ret
@@ -182,6 +182,42 @@ def __NormalizeVector(pt):
     norm = sqrt(pt.x * pt.x + pt.y * pt.y)
     return [t / norm for t in pt]
 
+
+def __FindPositionAndVectorAlongArc(track, pos, trackReversed):
+    """ return the x,y position and direction vector at a point on an arc """
+    radius     = track.GetRadius()
+    length     = track.GetLength()
+    arcCenter  = track.GetPosition() # or maybe track.GetCenter()
+
+    # startAngle, endAngle are the absolute start and end.
+    # angle is the included angle of the arc, negative if anticlockwise
+    if trackReversed:
+        angle      = -track.GetAngle()
+        startAngle = track.GetArcAngleEnd()
+    else:
+        angle      = track.GetAngle()
+        startAngle = track.GetArcAngleStart()
+
+    posAngle = startAngle + angle * pos/length
+
+    # angle is returned in units of TenthsOfADegree
+    posAngle *= pi/1800
+    pcos = cos(posAngle)
+    psin = sin(posAngle)
+
+    newX = arcCenter.x + pcos * radius
+    newY = arcCenter.y + psin * radius
+
+    # the vector points from start towards end
+    # posAngle points from centre to pos, so rotate by 90 degrees
+    if angle > 0:
+        vec = [ -psin, pcos ]
+    else:
+        vec = [ psin, -pcos ]
+
+    return (wxPoint(newX, newY), vec)
+
+
 def __ComputePoints(track, via, hpercent, vpercent, segs, follow_tracks,
                     trackLookup, noBulge):
     """Compute all teardrop points"""
@@ -189,28 +225,33 @@ def __ComputePoints(track, via, hpercent, vpercent, segs, follow_tracks,
     end = track.GetEnd()
     radius = via[1]/2.0
     w = track.GetWidth()/2
+    trackReversed = False
 
     if vpercent > 100:
         vpercent = 100
 
     # ensure that start is at the via/pad end
-    if __PointDistance(end, via[0]) < radius:
+    if __PointDistance(start, via[0]) > radius:
         start, end = end, start
+        trackReversed = True
 
     # get normalized track vector
     # it will be used a base vector pointing in the track direction
-    vecT = __NormalizeVector(end - start)
+    if type(track) == PCB_ARC:
+        arcP, vecT = __FindPositionAndVectorAlongArc(track, radius/2, trackReversed)
+    else:
+        vecT = __NormalizeVector(end - start)
 
     # Find point of intersection between track and edge of via
     # This normalizes teardrop lengths
     bdelta = FromMM(0.01)
-    backoff=0
-    while backoff<radius:
-        np = start + wxPoint( vecT[0]*backoff, vecT[1]*backoff )
+    backoff = 0
+    while backoff < radius:
+        np = start + wxPoint(vecT[0]*backoff, vecT[1]*backoff)
         if __PointDistance(np, via[0]) >= radius:
             break
         backoff += bdelta
-    start=np
+    start = np
 
     # vec now points from via to intersect point
     vec = __NormalizeVector(start - via[0])
@@ -224,11 +265,10 @@ def __ComputePoints(track, via, hpercent, vpercent, segs, follow_tracks,
         # if not long enough, attempt to walk back along the curved track
         while n+consumed < targetLength:
             match, t = __FindTouchingTrack(track, end, trackLookup)
-            if (match == False):
+            if (match is False):
                 break
-    
-            # [if angle is outside tolerance: break ?]
-    
+
+            backoff = 0
             consumed += n
             n = min(targetLength-consumed, t.GetLength())
             track = t
@@ -236,23 +276,31 @@ def __ComputePoints(track, via, hpercent, vpercent, segs, follow_tracks,
             start = t.GetStart()
             if match != STARTPOINT:
                 start, end = end, start
-    
+                trackReversed = True
+            else:
+                trackReversed = False
+
         # Track may now not point directly at via
         vecT = __NormalizeVector(end - start)
 
     # if shortened, shrink width too
     if n+consumed < targetLength:
-        minVpercent = 100* float(w) / float(radius)
+        minVpercent = 100 * float(w) / float(radius)
         vpercent = vpercent*n/targetLength + minVpercent*(1-n/targetLength)
 
     # find point on the track, sharp end of the teardrop
-    pointB = start + wxPoint( vecT[0]*n +vecT[1]*w , vecT[1]*n -vecT[0]*w )
-    pointA = start + wxPoint( vecT[0]*n -vecT[1]*w , vecT[1]*n +vecT[0]*w )
+    if type(track) == PCB_ARC:
+        start, vecT = __FindPositionAndVectorAlongArc(track, n + consumed + backoff, trackReversed)
+        pointB = start + wxPoint( vecT[1]*w, -vecT[0]*w)
+        pointA = start + wxPoint(-vecT[1]*w,  vecT[0]*w)
+    else:
+        pointB = start + wxPoint(vecT[0]*n + vecT[1]*w, vecT[1]*n - vecT[0]*w)
+        pointA = start + wxPoint(vecT[0]*n - vecT[1]*w, vecT[1]*n + vecT[0]*w)
 
     # In some cases of very short, eccentric tracks the points can end up
     # inside the teardrop. If this happens just cancel adding it
-    if ( __PointDistance(pointA, via[0]) < radius or
-         __PointDistance(pointB, via[0]) < radius ):
+    if (__PointDistance(pointA, via[0]) < radius or
+       __PointDistance(pointB, via[0]) < radius):
         return False
 
     # via side points
@@ -263,11 +311,11 @@ def __ComputePoints(track, via, hpercent, vpercent, segs, follow_tracks,
 
     if noBulge:
         # find (signed) angle between track and teardrop
-        offAngle = atan2(vecT[1],vecT[0]) - atan2(vec[1],vec[0])
+        offAngle = atan2(vecT[1], vecT[0]) - atan2(vec[1], vec[0])
         if offAngle > pi:
-            offAngle -=2*pi
+            offAngle -= 2*pi
         if offAngle < -pi:
-            offAngle +=2*pi
+            offAngle += 2*pi
 
         if offAngle+dC > pi/2:
             dC = pi/2 - offAngle
@@ -323,7 +371,7 @@ def SetTeardrops(hpercent=50, vpercent=90, segs=10, pcb=None, use_smd=False,
     if pcb is None:
         pcb = GetBoard()
 
-    pad_types = [PAD_ATTRIB_STANDARD] + [PAD_ATTRIB_SMD]*use_smd
+    pad_types = [PAD_ATTRIB_PTH] + [PAD_ATTRIB_SMD]*use_smd
     vias = __GetAllVias(pcb)[0] + __GetAllPads(pcb, pad_types)[0]
     vias_selected = __GetAllVias(pcb)[1] + __GetAllPads(pcb, pad_types)[1]
     if len(vias_selected) > 0:
@@ -332,25 +380,26 @@ def SetTeardrops(hpercent=50, vpercent=90, segs=10, pcb=None, use_smd=False,
     trackLookup = {}
     if follow_tracks:
         for t in pcb.GetTracks():
-            if type(t) == TRACK:
+            if isinstance(t, PCB_TRACK):
                 net = t.GetNetname()
                 layer = t.GetLayer()
-    
+
                 if layer not in trackLookup:
                     trackLookup[layer] = {}
                 if net not in trackLookup[layer]:
-                    trackLookup[layer][net]=[]
+                    trackLookup[layer][net] = []
                 trackLookup[layer][net].append(t)
-
 
     teardrops = __GetAllTeardrops(pcb)
     count = 0
-    for track in [t for t in pcb.GetTracks() if type(t)==TRACK]:
+
+    for track in [t for t in pcb.GetTracks() if isinstance(t, PCB_TRACK)]:
         for via in [v for v in vias if track.IsPointOnEnds(v[0], int(v[1]/2))]:
-            if (track.GetWidth() >= via[1] * vpercent / 100):
+            if track.GetWidth() >= via[1] * vpercent / 100:
                 continue
 
-            if track.IsPointOnEnds(via[0], int(via[1]/2))==STARTPOINT|ENDPOINT:
+            if track.IsPointOnEnds(via[0], int(via[1]/2)) == \
+               STARTPOINT | ENDPOINT:
                 # both start and end are within the via
                 continue
 
@@ -380,7 +429,6 @@ def SetTeardrops(hpercent=50, vpercent=90, segs=10, pcb=None, use_smd=False,
                     count += 1
 
     RebuildAllZones(pcb)
-    print('{0} teardrops inserted'.format(count))
     return count
 
 
@@ -398,5 +446,4 @@ def RmTeardrops(pcb=None):
             count += 1
 
     RebuildAllZones(pcb)
-    print('{0} teardrops removed'.format(count))
     return count
